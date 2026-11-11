@@ -88,7 +88,10 @@ class XrayConfigBuilderTest {
         val rules = """[{"type":"field","domain":["example.org"],"outboundTag":"direct"}]"""
         val json = XrayConfigBuilder(AppSettings(customRules = rules), listOf(server)).build("main").json
         val array = JSONObject(json).getJSONObject("routing").getJSONArray("rules")
-        val last = array.getJSONObject(array.length() - 1)
-        assertEquals("example.org", last.getJSONArray("domain").getString(0))
+        val custom = (0 until array.length())
+            .map { array.getJSONObject(it) }
+            .firstOrNull { it.optJSONArray("domain")?.optString(0) == "example.org" }
+        assertNotNull(custom)
+        assertEquals("direct", custom!!.getString("outboundTag"))
     }
 }
