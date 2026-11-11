@@ -2,10 +2,10 @@ package com.antinet.vpn.shizuku
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.LinkAddress
 import android.net.LinkProperties
 import android.net.Network
 import android.net.TetheringManager
+import android.os.Build
 import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
@@ -44,6 +44,7 @@ class ShizukuUserService : IShizukuUserService.Stub {
     private var networkBinder: IBinder? = null
     private var preferSet = false
     private var tetheringRequested = false
+    private var tetheringRequest: Any? = null
 
     constructor() : super()
 
@@ -76,7 +77,10 @@ class ShizukuUserService : IShizukuUserService.Stub {
         runCatching {
             val manager = ctx.getSystemService("test_network")
                 ?: error("TestNetworkManager недоступен на этом Android")
-            val linkAddress = LinkAddress(InetAddress.getByName(HOTSPOT_ADDRESS), HOTSPOT_PREFIX)
+            // LinkAddress constructors are hidden: build the address reflectively.
+            val linkAddress = Class.forName("android.net.LinkAddress")
+                .getConstructor(InetAddress::class.java, Int::class.javaPrimitiveType)
+                .newInstance(InetAddress.getByName(HOTSPOT_ADDRESS), HOTSPOT_PREFIX)
             val create = manager.javaClass.getMethod("createTunInterface", Collection::class.java)
             val testInterface = create.invoke(manager, listOf(linkAddress))
                 ?: error("Не удалось создать тестовый TUN")
@@ -88,29 +92,25 @@ class ShizukuUserService : IShizukuUserService.Stub {
                 .invoke(testInterface) as ParcelFileDescriptor
 
             networkBinder = Binder()
+            // The 3-argument variant carries DNS servers for the test network;
+            // the 2-argument one is the long-standing fallback.
             val link = LinkProperties()
-            val nameSet = runCatching {
-                LinkProperties::class.java
-                    .getMethod("setInterfaceName", String::class.java)
-                    .invoke(link, interfaceName)
-            }.isSuccess
-            link.addDnsServer(InetAddress.getByName(dns.ifBlank { "1.1.1.1" }))
-
-            if (nameSet) {
-                runCatching {
-                    manager.javaClass
-                        .getMethod(
-                            "setupTestNetwork",
-                            LinkProperties::class.java,
-                            Boolean::class.javaPrimitiveType,
-                            IBinder::class.java,
-                        )
-                        .invoke(manager, link, false, networkBinder)
-                }.onFailure {
-                    Log.w(TAG, "setupTestNetwork(lp) failed, falling back", it)
-                    setupByName(manager, interfaceName)
-                }
-            } else {
+            link.setInterfaceName(interfaceName)
+            link.setDnsServers(listOf(InetAddress.getByName(dns.ifBlank { "1.1.1.1" })))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                link.setMtu(mtu)
+            }
+            runCatching {
+                manager.javaClass
+                    .getMethod(
+                        "setupTestNetwork",
+                        LinkProperties::class.java,
+                        Boolean::class.javaPrimitiveType,
+                        IBinder::class.java,
+                    )
+                    .invoke(manager, link, false, networkBinder)
+            }.onFailure {
+                Log.w(TAG, "setupTestNetwork(lp) failed, falling back", it)
                 setupByName(manager, interfaceName)
             }
 
@@ -169,13 +169,21 @@ class ShizukuUserService : IShizukuUserService.Stub {
             }
         }
         val executor = Executor { it.run() }
-        val request = runCatching {
-            val builderClass = Class.forName("android.net.TetheringManager\$StartTetheringRequest\$Builder")
-            val builder = builderClass
-                .getConstructor(Int::class.javaPrimitiveType)
-                .newInstance(TETHERING_WIFI)
-            builderClass.getMethod("build").invoke(builder)
-        }.getOrNull()
+        // Android 13+ exposes TetheringManager.TetheringRequest.Builder; a few
+        // builds renamed it to StartTetheringRequest.
+        val request = listOf(
+            "android.net.TetheringManager\$TetheringRequest\$Builder",
+            "android.net.TetheringManager\$StartTetheringRequest\$Builder",
+        ).firstNotNullOfOrNull { name ->
+            runCatching {
+                val builderClass = Class.forName(name)
+                val builder = builderClass
+                    .getConstructor(Int::class.javaPrimitiveType)
+                    .newInstance(TETHERING_WIFI)
+                builderClass.getMethod("build").invoke(builder)
+            }.getOrNull()
+        }
+        tetheringRequest = request
         runCatching {
             if (request != null) {
                 TetheringManager::class.java
@@ -199,14 +207,52 @@ class ShizukuUserService : IShizukuUserService.Stub {
         }.onFailure { Log.w(TAG, "startTethering failed", it) }
     }
 
+    /**
+     * Android 16 removed the int overload from the SDK, so the request-based
+     * call is preferred and the int one is only a fallback.
+     */
+    private fun stopTethering(manager: TetheringManager) {
+        val request = tetheringRequest
+        tetheringRequest = null
+        if (request != null) {
+            val stopped = runCatching {
+                val callbackClass = Class.forName("android.net.TetheringManager\$StopTetheringCallback")
+                val callback = Proxy.newProxyInstance(
+                    javaClass.classLoader,
+                    arrayOf(callbackClass),
+                ) { proxy, method, args ->
+                    when (method.name) {
+                        "toString" -> "AntiNetStopTetheringCallback"
+                        "hashCode" -> System.identityHashCode(proxy)
+                        "equals" -> proxy === args?.firstOrNull()
+                        else -> null
+                    }
+                }
+                val requestClass = Class.forName("android.net.TetheringManager\$TetheringRequest")
+                TetheringManager::class.java
+                    .getMethod(
+                        "stopTethering",
+                        requestClass,
+                        Executor::class.java,
+                        callbackClass,
+                    )
+                    .invoke(manager, request, Executor { it.run() }, callback)
+            }
+            if (stopped.isSuccess) return
+        }
+        runCatching {
+            TetheringManager::class.java
+                .getMethod("stopTethering", Int::class.javaPrimitiveType)
+                .invoke(manager, TETHERING_WIFI)
+        }.onFailure { Log.w(TAG, "stopTethering failed", it) }
+    }
+
     @Synchronized
     private fun doStop() {
         val ctx = context
         if (tetheringRequested) {
             tetheringRequested = false
-            runCatching {
-                ctx?.getSystemService(TetheringManager::class.java)?.stopTethering(TETHERING_WIFI)
-            }
+            ctx?.getSystemService(TetheringManager::class.java)?.let { stopTethering(it) }
         }
         if (preferSet) {
             preferSet = false

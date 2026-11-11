@@ -23,7 +23,9 @@ object TunFactory {
     const val HOTSPOT_PREFIX_V4 = 24
 
     fun establish(service: VpnService, settings: AppSettings): ParcelFileDescriptor {
-        val builder = VpnService.Builder()
+        // VpnService.Builder is an inner class: it must be created from the
+        // running service instance.
+        val builder = service.Builder()
         builder.setSession("AntiNet")
         builder.setMtu(settings.mtu)
         builder.addAddress(ADDRESS_V4, PREFIX_V4)
