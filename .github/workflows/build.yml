@@ -1,0 +1,87 @@
+name: Build AntiNet APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '14742923'
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      # Two gomobile cores share the same APK: libv2ray (Xray) and libbox
+      # (sing-box). Both AARs ship the generated go.Seq runtime; keep the
+      # sing-box copy (it is a superset) and strip the duplicate from libv2ray.
+      - name: Fetch Xray core (libv2ray.aar)
+        run: |
+          mkdir -p app/libs
+          curl -fL --retry 3 --retry-delay 2 \
+            -o /tmp/libv2ray-full.aar \
+            https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar
+          rm -rf /tmp/libv2ray && mkdir -p /tmp/libv2ray
+          (cd /tmp/libv2ray && unzip -q /tmp/libv2ray-full.aar && zip -q -d classes.jar 'go/*')
+          (cd /tmp/libv2ray && zip -q -r /tmp/libv2ray.aar .)
+          mv /tmp/libv2ray.aar app/libs/libv2ray.aar
+          unzip -l app/libs/libv2ray.aar | grep -q 'jni/arm64-v8a/libgojni.so'
+          unzip -l app/libs/libv2ray.aar | grep -q 'classes.jar'
+
+      - name: Fetch sing-box core (libbox.aar)
+        run: |
+          curl -fL --retry 3 --retry-delay 2 \
+            -o app/libs/libbox.aar \
+            https://repo1.maven.org/maven2/net/clever-vpn/libbox-android/2.1.5/libbox-android-2.1.5.aar
+          unzip -l app/libs/libbox.aar | grep -q 'jni/arm64-v8a/libbox.so'
+          unzip -p app/libs/libbox.aar classes.jar > /tmp/libbox-classes.jar
+          unzip -l /tmp/libbox-classes.jar | grep -q 'go/Seq.class'
+
+      - name: Run unit tests
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Build debug APKs
+        run: ./gradlew :app:assembleDebug -PABI_FILTERS='arm64-v8a;x86_64' --stacktrace
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: AntiNet-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish arm64 test build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=$(ls app/build/outputs/apk/debug/*arm64-v8a*.apk | head -n1)
+          test -n "$apk"
+          cp "$apk" AntiNet-arm64-v8a-debug.apk
+          gh release view ci-arm64 >/dev/null 2>&1 || \
+            gh release create ci-arm64 \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "CI arm64 build" \
+              --notes "Automated debug build for device testing."
+          gh release upload ci-arm64 AntiNet-arm64-v8a-debug.apk --clobber
